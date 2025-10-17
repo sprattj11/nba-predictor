@@ -2,7 +2,7 @@
 NBA Game Predictor — Project Overview
 ========================================
 
-Author: [Your Name]
+Author: Jason Spratt
 Last Updated: 2025-10-17
 Language: Python 3.13
 Environment: macOS / venv (.venv)
