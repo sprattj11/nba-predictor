@@ -1,6 +1,6 @@
 # 🏀 NBA Game Predictor
 
-**Author:** [Your Name]  
+**Author:** Jason Spratt  
 **Last Updated:** 2025-10-17  
 **Language:** Python 3.13  
 **Environment:** macOS / venv (`.venv`)
@@ -28,30 +28,36 @@ An interactive command-line tool lets you input team abbreviations and a date to
 - Organized modular code: `src/`, `scripts/`, `data/`, `models/`
 - Automated workflows with `Makefile` commands
 
----
+------------------------------------------------------
+2) Project Directory Structure
+------------------------------------------------------
 
-## 📁 Project Structure
 nba-predictor/
+│
 ├── data/
 │   ├── nba_games.csv
 │   ├── games_details.csv
 │   ├── players.csv
 │   ├── ranking.csv
 │   └── teams.csv
+│
 ├── models/
 │   ├── xgb_nba_model.joblib
 │   └── README.md
+│
 ├── scripts/
 │   ├── train_xgb.py
 │   ├── predict_by_abbrev_with_nbaapi.py
 │   └── predict_from_history.py
+│
 ├── src/
 │   └── features.py
+│
 ├── Makefile
 ├── requirements.txt
 └── README.md
 
----
+------------------------------------------------------
 
 ## 🚀 Setup & Installation
 Clone the repository:
@@ -152,6 +158,6 @@ nba_api
 ---
 
 ## 📅 License
-MIT License © 2025 [Your Name]
+MIT License © 2025 Jason Spratt
 
 ---
