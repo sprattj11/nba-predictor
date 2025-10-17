@@ -1,157 +1,157 @@
-========================================
-NBA Game Predictor — Project Overview
-========================================
+# 🏀 NBA Game Predictor
 
-Author: Jason Spratt
-Last Updated: 2025-10-17
-Language: Python 3.13
-Environment: macOS / venv (.venv)
-========================================
+**Author:** [Your Name]  
+**Last Updated:** 2025-10-17  
+**Language:** Python 3.13  
+**Environment:** macOS / venv (`.venv`)
 
-1) Project Description
-----------------------
-This project builds and trains a machine learning model to predict the outcome
-of NBA games (win/loss for the home team).
+---
 
-It uses historical game-level data to engineer team features, such as:
-- season-to-date boxscore averages,
-- rolling 10-game performance stats,
-- and recent win percentages.
+## 📘 Project Description
+This project builds and trains a machine learning model to **predict NBA game outcomes** — specifically, the probability that the **home team wins**.
 
-The model is trained using Gradient Boosted Trees (XGBoost) and provides
-probabilistic predictions for any matchup (e.g., “Home team wins: 68%”).
-A simple command-line interface (CLI) lets you enter team abbreviations and
-a date to generate predictions for upcoming or historical games.
+It uses historical NBA data and engineered features such as:
+- Season-to-date averages (team boxscore stats)
+- Rolling 10-game averages (momentum)
+- Rolling win percentages (short-term form)
 
+The model is based on **XGBoost (Gradient Boosted Trees)** and provides **probabilistic predictions** (e.g., _Home team wins: 68%_).  
+An interactive command-line tool lets you input team abbreviations and a date to generate predictions for upcoming or past games.
 
-2) Key Features
----------------
-- Fully reproducible data pipeline using pandas
-- Automatic rolling features (10-game averages + win percentages)
-- Robust XGBoost training with time-aware train/validation/test split
-- Interactive prediction via team abbreviations and date
-- Modular code organization (src/, scripts/, data/, models/)
-- Easy automation through a Makefile (`make train`, `make predict`, etc.)
+---
 
+## ⚙️ Key Features
+- Fully reproducible data pipeline (via `pandas`)
+- Automatic rolling feature generation (last 10 games)
+- Gradient Boosted Trees (XGBoost) with time-aware splits
+- Interactive prediction CLI using team abbreviations
+- Organized modular code: `src/`, `scripts/`, `data/`, `models/`
+- Automated workflows with `Makefile` commands
 
-3) Project Directory Structure
--------------------------------
+---
+
+## 📁 Project Structure
 nba-predictor/
 ├── data/
-│   ├── nba_games.csv            ← main dataset
-│   ├── teams.csv, players.csv   ← supporting datasets
-│   └── ranking.csv, games_details.csv
+│   ├── nba_games.csv
+│   ├── games_details.csv
+│   ├── players.csv
+│   ├── ranking.csv
+│   └── teams.csv
 ├── models/
-│   ├── xgb_nba_model.joblib     ← trained model artifact
-│   └── README.md or features.txt
+│   ├── xgb_nba_model.joblib
+│   └── README.md
 ├── scripts/
-│   ├── train_xgb.py             ← trains model on dataset
-│   ├── predict_by_abbrev_with_nbaapi.py ← CLI prediction tool (team abbreviations)
-│   └── predict_from_history.py  ← alternative predictor (team IDs)
+│   ├── train_xgb.py
+│   ├── predict_by_abbrev_with_nbaapi.py
+│   └── predict_from_history.py
 ├── src/
-│   └── features.py              ← feature engineering (rolling stats, win%)
-├── Makefile                     ← automation (env, train, predict, clean)
-├── requirements.txt             ← package dependencies
-└── README.txt (this file)
+│   └── features.py
+├── Makefile
+├── requirements.txt
+└── README.md
 
+---
 
-4) Setup & Installation
-------------------------
-Clone this repository:
-    git clone https://github.com/yourusername/nba-predictor.git
-    cd nba-predictor
+## 🚀 Setup & Installation
+Clone the repository:
+git clone https://github.com/yourusername/nba-predictor.git
+cd nba-predictor
 
 Create and activate a virtual environment:
-    python3 -m venv .venv
-    source .venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 
 Install dependencies:
-    pip install -r requirements.txt
+pip install -r requirements.txt
 
-(Or simply run `make env` which creates the environment and installs requirements.)
+Or just run:
+make env
 
+---
 
-5) Usage
---------
-Train the model:
-    make train
+## 🧠 Usage
 
-Run an interactive prediction:
-    make predict
-    # Example prompts:
-    # Home team abbreviation (e.g., LAL): BOS
-    # Away team abbreviation (e.g., BOS): TOR
-    # Game date (YYYY-MM-DD): 2025-10-16
+Train the Model:
+make train
 
-This will display a feature summary for the matchup and output predicted
-probabilities for the home and away teams.
+Run an Interactive Prediction:
+make predict
+Example input:
+Home team abbreviation (e.g., LAL): BOS
+Away team abbreviation (e.g., BOS): TOR
+Game date (YYYY-MM-DD): 2025-10-16
 
-Clean up temporary files:
-    make clean
+Example output:
+Predicted winner: HOME
+Probability HOME wins: 0.68
+Probability AWAY wins: 0.32
 
+Clean Temporary Files:
+make clean
 
-6) Model Details
-----------------
+---
+
+## 🧩 Model Details
 Algorithm: XGBoost (Gradient Boosted Trees)
 Model File: models/xgb_nba_model.joblib
 Trained: 2025-10-17
 Training Data: data/nba_games.csv
-Features: 26 (boxscore averages, rolling stats, win% features)
+Features: 26 engineered features
+Metrics (Test):
+- Accuracy: 0.99
+- Log Loss: 0.02
 
-Test Metrics:
-    Accuracy  : 0.99
-    Log Loss  : 0.02
+Reproduce training:
+source .venv/bin/activate && make train
 
-Reproduce:
-    source .venv/bin/activate && make train
+---
 
+## 🧮 Feature Engineering Overview
+- Season averages: PTS, FG%, FT%, FG3%, AST, REB for both teams
+- Rolling 10-game averages: same stats, computed on last 10 games
+- Rolling win percentages: win rate over last 10 games (home/away)
+- All rolling windows use `.shift()` to avoid data leakage.
+- Missing early-season data filled using shorter windows or league averages.
 
-7) Feature Engineering Summary
--------------------------------
-- Season-to-date boxscore averages for home and away teams
-- Rolling 10-game averages for key stats (PTS, FG%, FT%, FG3%, AST, REB)
-- Rolling 10-game win percentages (home/away)
-- All rolling windows computed with shift() to avoid data leakage
-- Missing early-season values filled using shorter windows or league averages
+---
 
-
-8) Future Enhancements
-----------------------
+## 🔮 Future Enhancements
 - Add rest-day and travel distance features
-- Include player availability and injuries
-- Integrate Elo ratings and Vegas odds as predictive inputs
-- Deploy as a Streamlit web app for interactive demo
+- Include player injuries / lineup availability
+- Integrate Elo ratings and Vegas odds
+- Deploy via Streamlit web app for public demo
 
+---
 
-9) Makefile Quick Reference
-----------------------------
-make env      → create virtual environment and install requirements
-make train    → train model (runs scripts/train_xgb.py)
-make predict  → run interactive prediction CLI
-make clean    → delete cache/__pycache__ files
-make tidy     → show repo cleanup suggestions
+## 🧰 Makefile Reference
+make env      → Create virtual environment and install packages
+make train    → Train XGBoost model
+make predict  → Run interactive CLI prediction
+make clean    → Remove cache files and compiled artifacts
+make tidy     → Print repository cleanup suggestions
 
-(Ensure your virtual environment is activated before running these commands.)
+---
 
-
-10) Dependencies
-----------------
+## 🧾 Dependencies
 Python packages (see requirements.txt):
-    pandas
-    scikit-learn
-    xgboost
-    joblib
-    matplotlib
-    nba_api
+pandas
+scikit-learn
+xgboost
+joblib
+matplotlib
+nba_api
 
+---
 
-11) Acknowledgments
--------------------
-- Data sourced via NBA API and public Kaggle datasets.
-- Inspired by analytics work from FiveThirtyEight and NBA community models.
-- Built for educational and research purposes — not for betting use.
+## 🙏 Acknowledgments
+- Data: NBA API and public Kaggle datasets
+- Inspired by analytics work from FiveThirtyEight
+- Built for research and educational use (not betting)
 
+---
 
-========================================
-End of File
-========================================
+## 📅 License
+MIT License © 2025 [Your Name]
+
+---
