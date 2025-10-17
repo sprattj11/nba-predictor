@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# virtualenv
+.venv/
+env/
+venv/
+
+# Data and models (do not commit big datasets)
+nba_games.csv
+data/
+models/
+
+# OS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
