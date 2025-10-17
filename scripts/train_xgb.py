@@ -13,12 +13,19 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics import accuracy_score, log_loss
 from xgboost import XGBClassifier
-
-# change this if your features file is elsewhere
 from src.features import add_rolling_features
+from pathlib import Path
 
-GAMES_CSV = "nba_games.csv"
-MODEL_OUT = "xgb_nba_model.joblib"
+# compute project root (one level up from scripts/)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# dataset and model paths
+GAMES_CSV = PROJECT_ROOT / "data" / "nba_games.csv"
+MODEL_OUT = PROJECT_ROOT / "models" / "xgb_nba_model.joblib"
+
+# make sure the model folder exists
+MODEL_OUT.parent.mkdir(parents=True, exist_ok=True)
+
 RANDOM_STATE = 42
 
 # ---- Load and prepare data ----
