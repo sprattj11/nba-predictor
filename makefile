@@ -21,7 +21,7 @@ train:
 # -------------------------------------
 spread:
 	@echo "🏀 Starting interactive spread predictor..."
-	$(PYTHON) $(MODEL_DIR)/interactive_predict_spread.py --games $(DATA_DIR)/games_summary_merged.csv --model $(MODEL_DIR)/spread_model.pkl
+	$(PYTHON) $(MODEL_DIR)/interactive_predict_spread_market.py --games $(DATA_DIR)/games_summary_merged.csv --model $(MODEL_DIR)/spread_model.pkl
 
 # -------------------------------------
 # 🧹  Cleanup compiled files and caches
