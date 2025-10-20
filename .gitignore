@@ -25,3 +25,4 @@ models/*.joblib
 .idea/
 data/*.csv
 *.pkl
+*.pkl
