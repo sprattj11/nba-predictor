@@ -26,3 +26,9 @@ models/*.joblib
 data/*.csv
 *.pkl
 *.pkl
+
+# Generated output files
+eval/merged_ats_results.csv
+eval/predictions.csv
+eval_report.csv
+metrics_history.csv
