@@ -19,8 +19,8 @@ COMMON_COLUMN_ALIASES = {
     "season": ["season", "season_id", "season_year"],
     "home_team": ["home_team", "home", "home_team_name", "home_team_id"],
     "away_team": ["away_team", "away", "away_team_name", "away_team_id"],
-    "home_pts": ["home_pts", "home_points", "home_score", "pts_home"],
-    "away_pts": ["away_pts", "away_points", "away_score", "pts_away"],
+    "home_pts": ["home_pts", "home_points", "home_score", "pts_home", "score_home"],
+    "away_pts": ["away_pts", "away_points", "away_score", "pts_away", "score_away"],
     "book_line": ["bookmaker_line", "line", "spread", "home_spread", "book_line", "line_home"],
     # optional: elo or ratings if present
     "home_elo": ["home_elo", "elo_home", "home_rating"],
@@ -42,55 +42,103 @@ def infer_columns(df: pd.DataFrame) -> Dict[str,str]:
             mapping[canonical] = col
     return mapping
 
+def _looks_like_date_series(s: pd.Series) -> bool:
+    """Heuristic: check whether a series contains many date-like strings or datetimes."""
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return True
+    # sample a few non-null values and see if they parse to datetimes
+    sample = s.dropna().astype(str).head(20).tolist()
+    if not sample:
+        return False
+    parsed = 0
+    for v in sample:
+        # quick heuristics: common separators or year-like prefix
+        if "-" in v or "/" in v or (len(v) >= 4 and v[:4].isdigit()):
+            parsed += 1
+    return parsed >= max(1, len(sample)//4)  # if ~25% of sample looks like date, treat as date-like
+
 def load_games(csv_path: str) -> Tuple[pd.DataFrame, Dict[str,str]]:
-    """Load CSV, parse dates, infer columns, return df and mapping."""
-    df = pd.read_csv(csv_path)
-    # try parse any date-like column automatically if present
-    # Prefer explicit names
+    """Load CSV, parse dates, infer columns, return df and mapping.
+
+    More robust than earlier: uses low_memory=False, prefers actual date-like
+    columns (excluding id columns), and avoids forcing the first column to be parsed.
+    """
+    # read with low_memory=False to avoid mixed-type chunking warnings
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    # look for explicit date-like columns (prefer names containing 'date' but exclude "*id*")
+    name_candidates = [c for c in df.columns if "date" in c.lower() and "id" not in c.lower()]
+    date_col_chosen = None
+
+    # prefer explicit names list first (existing behavior)
     for dcol in ["date", "game_date", "gamedate", "game_date_utc"]:
         if dcol in df.columns:
-            df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
+            date_col_chosen = dcol
             break
-    # Fallback: parse first datetime-like column
-    if not any(pd.api.types.is_datetime64_any_dtype(df[c]) for c in df.columns):
-        # attempt to parse a column that contains 'date' in its name
-        date_candidates = [c for c in df.columns if "date" in c.lower()]
-        if date_candidates:
-            df[date_candidates[0]] = pd.to_datetime(df[date_candidates[0]], errors="coerce")
-    # If still none, try to parse first column
-    if not any(pd.api.types.is_datetime64_any_dtype(df[c]) for c in df.columns):
-        try:
-            df.iloc[:,0] = pd.to_datetime(df.iloc[:,0], errors="coerce")
-        except Exception:
-            pass
+
+    # if not found, try name_candidates
+    if date_col_chosen is None and name_candidates:
+        date_col_chosen = name_candidates[0]
+
+    # if still not found, check for any column that looks like a date (but skip obvious id columns)
+    if date_col_chosen is None:
+        for c in df.columns:
+            if "id" in c.lower():
+                continue
+            if _looks_like_date_series(df[c]):
+                date_col_chosen = c
+                break
+
+    # If still none, fall back to first column ONLY if it looks like a date
+    if date_col_chosen is None:
+        first_col = df.columns[0]
+        if _looks_like_date_series(df[first_col]) and "id" not in first_col.lower():
+            date_col_chosen = first_col
+
+    # If we still couldn't find a date, raise a clear error (instead of silently picking GAME_ID)
+    if date_col_chosen is None:
+        raise ValueError(
+            "Couldn't find a date column automatically. Candidate columns inspected: "
+            f"{[c for c in df.columns if 'date' in c.lower() or 'game' in c.lower()][:20]}. "
+            "Please ensure your CSV contains a valid date column (e.g., 'date' or 'game_date'), "
+            "or modify COMMON_COLUMN_ALIASES accordingly."
+        )
+
+    # Parse the selected date column to datetime
+    try:
+        df[date_col_chosen] = pd.to_datetime(df[date_col_chosen], errors="coerce")
+    except Exception:
+        df[date_col_chosen] = pd.to_datetime(df[date_col_chosen].astype(str), errors="coerce")
+
+    # warn if many values failed to parse
+    n_failed = df[date_col_chosen].isna().sum()
+    if n_failed > 0:
+        pct = n_failed / max(1, len(df)) * 100
+        print(f"Warning: {n_failed} / {len(df)} ({pct:.2f}%) rows failed to parse from '{date_col_chosen}' to datetime. "
+              "Check CSV formatting or provide a clearer date column.")
 
     colmap = infer_columns(df)
-    # Ensure canonical 'date' mapping exists: choose existing date-like column
-    if "date" not in colmap:
-        for c in df.columns:
-            if pd.api.types.is_datetime64_any_dtype(df[c]):
-                colmap["date"] = c
-                break
-    # If still missing, raise an informative error
-    if "date" not in colmap:
-        raise ValueError("Couldn't find a date column. Please ensure your CSV has a date column.")
-    # Standardize date column to datetime
-    df[colmap["date"]] = pd.to_datetime(df[colmap["date"]], errors="coerce")
-    if df[colmap["date"]].isna().any():
-        print("Warning: some dates failed to parse to datetime; check CSV formatting.")
+
+    # Ensure canonical 'date' mapping exists; prefer the explicit chosen column
+    colmap["date"] = date_col_chosen
 
     return df, colmap
+
 
 def build_team_game_table(games: pd.DataFrame, colmap: dict) -> pd.DataFrame:
     """
     Build a per-team per-game table (one row per team per game) useful
     to compute rolling per-team stats.
+    Assumes games index is the original game identifier (used as game_id).
     """
     date_col = colmap["date"]
+    # preserve original index as game_id to make merges unambiguous
+    games = games.copy()
+    games = games.reset_index().rename(columns={"index":"game_id"})
     rows = []
-    for idx, r in games.iterrows():
+    for _, r in games.iterrows():
         home = {
-            "game_id": idx,
+            "game_id": r["game_id"],
             "date": r[date_col],
             "team": r[colmap["home_team"]],
             "is_home": 1,
@@ -99,7 +147,7 @@ def build_team_game_table(games: pd.DataFrame, colmap: dict) -> pd.DataFrame:
             "opp_pts": r[colmap["away_pts"]],
         }
         away = {
-            "game_id": idx,
+            "game_id": r["game_id"],
             "date": r[date_col],
             "team": r[colmap["away_team"]],
             "is_home": 0,
@@ -109,7 +157,7 @@ def build_team_game_table(games: pd.DataFrame, colmap: dict) -> pd.DataFrame:
         }
         rows.append(home)
         rows.append(away)
-    team_games = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+    team_games = pd.DataFrame(rows).sort_values(["team","date"]).reset_index(drop=True)
     # basic derived stats
     team_games["margin"] = team_games["team_pts"] - team_games["opp_pts"]
     team_games["win"] = (team_games["margin"] > 0).astype(int)
@@ -122,108 +170,116 @@ def add_rolling_features(games: pd.DataFrame,
     """
     Accepts raw games (one row per game), returns games augmented with features.
     Features are computed using only prior games (shifted) to avoid leakage.
+
+    NOTE: This function computes robust rest features (days since previous game)
+    for both home and away teams plus b2b flags. It also computes the rolling
+    statistics used previously.
     """
-    g = games.copy().sort_values(colmap["date"]).reset_index(drop=True)
-    # ensure score columns exist
+    # Work on a copy, but keep original index to use as game_id
+    g = games.copy()
+    # make sure date col is datetime
+    g[colmap["date"]] = pd.to_datetime(g[colmap["date"]], errors="coerce")
+    # basic validation
     if colmap.get("home_pts") not in g.columns or colmap.get("away_pts") not in g.columns:
         raise ValueError("Couldn't find home/away score columns in CSV. Found mapping: {}".format(colmap))
-    # build team-level table
+
+    # Build per-team per-game table (this sets game_id = original index)
     team_games = build_team_game_table(g, colmap)
-    # compute per-team rolling stats
-    rolling_stats = []
+
+    # --- Rolling stats (margin/pts/winrate) computed using prior games only ---
+    feat_cols = []
     for w in windows:
-        # margin rolling mean
-        team_games[f"margin_roll_{w}"] = team_games.groupby("team")["margin"].shift(1).rolling(window=w, min_periods=1).mean()
-        team_games[f"winrate_roll_{w}"] = team_games.groupby("team")["win"].shift(1).rolling(window=w, min_periods=1).mean()
-        # scoring rate
-        team_games[f"pts_roll_{w}"] = team_games.groupby("team")["team_pts"].shift(1).rolling(window=w, min_periods=1).mean()
-        team_games[f"opp_pts_roll_{w}"] = team_games.groupby("team")["opp_pts"].shift(1).rolling(window=w, min_periods=1).mean()
+        mcol = f"margin_roll_{w}"
+        wcol = f"winrate_roll_{w}"
+        pcol = f"pts_roll_{w}"
+        ocol = f"opp_pts_roll_{w}"
+        # shift by 1 to ensure only prior games are used
+        team_games[mcol] = team_games.groupby("team")["margin"].shift(1).rolling(window=w, min_periods=1).mean()
+        team_games[wcol] = team_games.groupby("team")["win"].shift(1).rolling(window=w, min_periods=1).mean()
+        team_games[pcol] = team_games.groupby("team")["team_pts"].shift(1).rolling(window=w, min_periods=1).mean()
+        team_games[ocol] = team_games.groupby("team")["opp_pts"].shift(1).rolling(window=w, min_periods=1).mean()
+        feat_cols += [mcol, wcol, pcol, ocol]
 
-    # merge rolling features back into original games for home and away
-    # prepare a lookup table: keys (date, team) -> features (we use game_id for uniqueness)
-    feat_cols = [c for c in team_games.columns if c.startswith("margin_roll_") or c.startswith("winrate_roll_") or c.startswith("pts_roll_") or c.startswith("opp_pts_roll_")]
-    team_feat = team_games[["game_id","date","team"] + feat_cols].copy()
-    # For merging we need the mapping from game index to game_id used above (we used idx before reset)
-    # In build_team_game_table we used the original games' index as game_id (that's fine)
-    # Build home features:
-    home_feat = team_feat.rename(columns={"team":"home_team"})
-    away_feat = team_feat.rename(columns={"team":"away_team"})
-    # merge on date & team by left join (use game index mapping game_id to game index)
-    # first add the original index as a column to g to map to game_id
-    g = g.reset_index().rename(columns={"index":"orig_index"})
-    # team_games has game_id equal to original index; so we can merge on game_id
-    # split team_games into home and away by selecting rows where is_home==1/0
-    # But simpler: create dictionaries keyed by (orig_index, team) to features
-    tg = team_games.copy()
-    tg_lookup = tg.set_index(["game_id","team"])[feat_cols].to_dict(orient="index")
+    # --- Rest features: days since previous game per team (robust vectorized approach) ---
+    # for each team row in team_games compute prev_date and days_rest
+    team_games["prev_date"] = team_games.groupby("team")["date"].shift(1)
+    team_games["days_rest"] = (team_games["date"] - team_games["prev_date"]).dt.days
+    # b2b flag: played previous day
+    team_games["is_b2b"] = (team_games["days_rest"] == 1).astype(int)
 
-    # helper to fetch features
-    def _get_team_feats(row, team_col):
-        key = (row.name, row[team_col])  # row.name is original index in g because of how build_team_game_table used idx
-        # if missing, fallback by matching on date & team (slower but safe)
-        if key in tg_lookup:
-            return tg_lookup[key]
-        # fallback:
-        match = tg[(tg["date"]==row[colmap["date"]]) & (tg["team"]==row[team_col])]
-        if not match.empty:
-            return match.iloc[0][feat_cols].to_dict()
-        # final fallback: return NaNs
-        return {c: np.nan for c in feat_cols}
+    # --- Prepare lookups to attach rolling features and rest back to game-level rows ---
+    # We'll pivot team_games to have per-game entries for home and away teams keyed by (game_id, team)
+    # Select columns to bring back
+    return_cols = ["game_id", "team"] + feat_cols + ["days_rest", "is_b2b"]
+    tg_small = team_games[return_cols].copy()
 
-    # Now for each game in g, attach home/away rolling features
-    home_feat_rows = []
-    away_feat_rows = []
-    for i, row in g.iterrows():
-        hf = _get_team_feats(row, colmap["home_team"])
-        af = _get_team_feats(row, colmap["away_team"])
-        home_feat_rows.append({f"home_{k}": v for k,v in hf.items()})
-        away_feat_rows.append({f"away_{k}": v for k,v in af.items()})
+    # split into home/away features by merging twice
+    # first ensure g has game_id column matching team_games' game_id
+    g = g.reset_index().rename(columns={"index":"game_id"})
 
-    home_df = pd.DataFrame(home_feat_rows, index=g.index)
-    away_df = pd.DataFrame(away_feat_rows, index=g.index)
-    out = pd.concat([g, home_df, away_df], axis=1)
+    # prepare home features: merge on game_id and team == home_team
+    home_tg = tg_small.rename(columns={
+        "team": "home_team",
+        "days_rest": "days_rest_home",
+        "is_b2b": "is_b2b_home",
+    })
+    # rename rolling feature columns to prefix 'home_'
+    home_tg = home_tg.rename(columns={c: f"home_{c}" for c in home_tg.columns if c not in ["game_id", "home_team"]})
 
-    # create derived features
+    away_tg = tg_small.rename(columns={
+        "team": "away_team",
+        "days_rest": "days_rest_away",
+        "is_b2b": "is_b2b_away",
+    })
+    away_tg = away_tg.rename(columns={c: f"away_{c}" for c in away_tg.columns if c not in ["game_id", "away_team"]})
+
+    # Merge home & away features onto g using (game_id, team)
+    merged = pd.merge(g, home_tg, left_on=["game_id", colmap["home_team"]], right_on=["game_id", "home_team"], how="left")
+    merged = pd.merge(merged, away_tg, left_on=["game_id", colmap["away_team"]], right_on=["game_id", "away_team"], how="left")
+
+    # Some seasons or first games will have NaNs for days_rest etc. Fill with reasonable defaults
+    # For rest days, a common neutral default is 3 (offseason/preseason or first game)
+    merged["days_rest_home"] = merged["home_days_rest"].fillna(3).astype(float)
+    merged["days_rest_away"] = merged["away_days_rest"].fillna(3).astype(float)
+    # b2b flags: if missing treat as 0
+    home_b2b = merged["home_is_b2b"] if "home_is_b2b" in merged.columns else pd.Series(0, index=merged.index)
+    away_b2b = merged["away_is_b2b"] if "away_is_b2b" in merged.columns else pd.Series(0, index=merged.index)
+
+    merged["is_b2b_home"] = home_b2b.fillna(0).astype(int)
+    merged["is_b2b_away"] = away_b2b.fillna(0).astype(int)
+
+    # rename any rolling feature columns that used the original names (they are prefixed with home_/away_)
+    # create derived differences for selected windows
     for w in windows:
-        out[f"home_minus_away_margin_roll_{w}"] = out[f"home_margin_roll_{w}"] - out[f"away_margin_roll_{w}"]
-        out[f"home_minus_away_winrate_{w}"] = out[f"home_winrate_roll_{w}"] - out[f"away_winrate_roll_{w}"]
-        out[f"home_minus_away_pts_{w}"] = out[f"home_pts_roll_{w}"] - out[f"away_pts_roll_{w}"]
+        # names created earlier were like 'margin_roll_5' -> after merge they should be 'home_margin_roll_5'
+        h_margin = f"home_margin_roll_{w}"
+        a_margin = f"away_margin_roll_{w}"
+        h_win = f"home_winrate_roll_{w}"
+        a_win = f"away_winrate_roll_{w}"
+        h_pts = f"home_pts_roll_{w}"
+        a_pts = f"away_pts_roll_{w}"
 
-    # rest days: compute days since previous game per team
-    out[colmap["date"]] = pd.to_datetime(out[colmap["date"]])
-    # compute per-team last game date
-    last_game_date = {}
-    home_rest = []
-    away_rest = []
-    for i, row in out.iterrows():
-        ht = row[colmap["home_team"]]
-        at = row[colmap["away_team"]]
-        d = row[colmap["date"]]
-        # home rest
-        if ht in last_game_date:
-            delta = (d - last_game_date[ht]).days
-            home_rest.append(delta)
-        else:
-            home_rest.append(np.nan)
-        # away rest
-        if at in last_game_date:
-            delta = (d - last_game_date[at]).days
-            away_rest.append(delta)
-        else:
-            away_rest.append(np.nan)
-        # update last_game_date for both teams to this date
-        last_game_date[ht] = d
-        last_game_date[at] = d
-    out["home_rest"] = home_rest
-    out["away_rest"] = away_rest
-    out["rest_diff"] = out["home_rest"] - out["away_rest"]
+        # derived differences (these will be NaN if underlying NaNs exist)
+        merged[f"home_minus_away_margin_roll_{w}"] = merged.get(h_margin) - merged.get(a_margin)
+        merged[f"home_minus_away_winrate_{w}"] = merged.get(h_win) - merged.get(a_win)
+        merged[f"home_minus_away_pts_{w}"] = merged.get(h_pts) - merged.get(a_pts)
 
-    # target: margin = home_pts - away_pts
-    out["margin"] = out[colmap["home_pts"]] - out[colmap["away_pts"]]
+    # rest diff and normalized rest features
+    merged["rest_diff"] = merged["days_rest_home"] - merged["days_rest_away"]
+    merged["home_rest"] = merged["days_rest_home"]
+    merged["away_rest"] = merged["days_rest_away"]
 
-    # filter early-season rows where not enough prior games if desired
-    # here we keep rows but user may drop NaNs later
-    return out
+    # target: margin = home_pts - away_pts (keep canonical naming)
+    merged["margin"] = merged[colmap["home_pts"]] - merged[colmap["away_pts"]]
+
+    # keep original columns from g (including date/home/away) plus features
+    # drop helper duplicate columns introduced by merges
+    # identify columns to drop ('home_team'/'away_team' from tg merges)
+    drop_cols = [c for c in merged.columns if c in ("home_team","away_team","home_days_rest","away_days_rest","home_is_b2b","away_is_b2b")]
+    merged = merged.drop(columns=[c for c in drop_cols if c in merged.columns])
+
+    # return merged which contains the original game-level data plus rolling & rest features
+    return merged
 
 def get_feature_list(windows=(5,10)):
     feats = []
@@ -233,7 +289,7 @@ def get_feature_list(windows=(5,10)):
             f"home_minus_away_winrate_{w}",
             f"home_minus_away_pts_{w}",
         ]
-    feats += ["rest_diff", "home_rest", "away_rest"]
+    feats += ["rest_diff", "home_rest", "away_rest", "is_b2b_home", "is_b2b_away"]
     return feats
 
 if __name__ == "__main__":
@@ -246,4 +302,9 @@ if __name__ == "__main__":
     print("Inferred columns:", colmap)
     feats = add_rolling_features(df, colmap)
     print("Built features, sample:")
-    print(feats.head()[list(feats.columns[:40])])
+    # show a stable subset of columns for quick inspection
+    sample_cols = [colmap["date"], colmap["home_team"], colmap["away_team"],
+                   "home_rest", "away_rest", "rest_diff"] + get_feature_list()
+    # print only columns that exist
+    sample_cols = [c for c in sample_cols if c in feats.columns]
+    print(feats.head()[sample_cols])

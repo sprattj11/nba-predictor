@@ -1,199 +1,268 @@
+#!/usr/bin/env python3
 """
 train_spread.py
 
-Train a LightGBM regression to predict game margin (home - away) from games_details.csv.
-Saves model artifact and evaluation CSV.
+Train a margin (home - away) regression model using features from features_and_prep.py.
 
-Usage:
-python train_spread.py --csv path/to/games_details.csv --model-out models/spread_model.pkl --report-out models/eval_report.csv
+Outputs:
+- models/spread_model.pkl
+- eval/predictions.csv (predicted margins for test set)
+- prints MAE / RMSE and ATS accuracy (if betting CSV with spreads is provided)
 """
-import argparse
+
 import os
+import argparse
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-import lightgbm as lgb
-
 from features_and_prep import load_games, add_rolling_features, get_feature_list
 
-def prepare_data(csv_path):
-    df, colmap = load_games(csv_path)
-    df_feats = add_rolling_features(df, colmap, windows=(5,10))
-    # drop rows missing target or core features
-    # identify feature list
-    features = get_feature_list(windows=(5,10))
-    # add any extra features if present (elo)
-    if "home_elo" in colmap and "away_elo" in colmap:
-        df_feats["elo_diff"] = df_feats[colmap["home_elo"]] - df_feats[colmap["away_elo"]]
-        features.append("elo_diff")
-    # add bookmaker_line if present
-    if colmap.get("book_line"):
-        # align book_line name
-        df_feats["book_line"] = df_feats[colmap["book_line"]]
-    else:
-        df_feats["book_line"] = np.nan
+# ATS helper (same logic we used before)
+def compute_ats_results(df, spread_col="spread", whos_favored_col="whos_favored",
+                        home_pts_col="home_pts", away_pts_col="away_pts"):
+    """Compute signed spread and ats_winner on a dataframe that contains scores."""
+    df = df.copy()
+    df["actual_margin"] = df[home_pts_col] - df[away_pts_col]
+    df["signed_spread"] = np.where(df[whos_favored_col].str.lower()=="home", -df[spread_col], df[spread_col])
+    df["ats_margin"] = df["actual_margin"] + df["signed_spread"]
+    df["ats_winner"] = np.where(df["ats_margin"]>0, "home", np.where(df["ats_margin"]<0, "away", "push"))
+    return df
 
-    # drop extreme missing rows
-    required_cols = ["margin"] + features
-    df_feats = df_feats.dropna(subset=required_cols, how="any")
-    return df_feats, features, colmap
+def ats_accuracy_from_predictions(merged, pred_col="pred_margin", signed_spread_col="signed_spread"):
+    """Given merged predictions and a signed spread, compute model ATS picks and accuracy."""
+    df = merged.copy()
+    # model_ats_margin = pred_margin + signed_spread
+    df["model_ats_margin"] = df[pred_col] + df[signed_spread_col]
+    df["model_pick"] = np.where(df["model_ats_margin"]>0, "home", np.where(df["model_ats_margin"]<0, "away", "push"))
+    df["correct_pick"] = df["model_pick"] == df["ats_winner"]
+    incl = df["correct_pick"].mean() * 100
+    excl = df[df["ats_winner"]!="push"]["correct_pick"].mean() * 100
+    pushes = (df["ats_winner"]=="push").sum()
+    return incl, excl, pushes
 
-def time_split_train_test(df, date_col, holdout_strategy="season_last", holdout_seasons=1):
-    """
-    Provide a simple time-based train/test split:
-    - If 'season_last': hold out the last season in the file
-    - Alternatively, can hold out most recent N days by specifying threshold date
-    """
-    if "season" in df.columns:
-        # if season exists (the original CSV may have it), use that; else fallback
-        if df["season"].notna().any():
-            # pick most recent season value(s)
-            seasons = sorted(df["season"].unique())
-            last_season = seasons[-1]
-            train = df[df["season"] < last_season].copy()
-            test = df[df["season"] == last_season].copy()
-            if train.empty or test.empty:
-                # fallback to date split (80/20)
-                cutoff = df["date"].quantile(0.8)
-                train = df[df["date"] <= cutoff].copy()
-                test = df[df["date"] > cutoff].copy()
+def main(args):
+    # 1) Load games and build features
+    print("Loading games:", args.games_csv)
+    games_df, colmap = load_games(args.games_csv)
+    print("Inferred columns:", colmap)
+    feats_df = add_rolling_features(games_df, colmap, windows=tuple(args.windows), min_games_required=args.min_games)
+    print("Built features. Rows:", len(feats_df))
+
+    # 2) Choose feature columns
+    base_feats = get_feature_list(windows=tuple(args.windows))
+    # also include rest & b2b features added in the patch
+    additional = ["home_rest", "away_rest", "rest_diff", "is_b2b_home", "is_b2b_away"]
+    feature_columns = [f for f in base_feats + additional if f in feats_df.columns]
+    print("Using features:", feature_columns)
+
+    # 3) Drop rows missing target or features
+    # defensive check before dropping NAs
+    # --- defensive patch start ---
+    # Ensure the required identifying columns exist in feats_df before dropping NAs.
+    # Use colmap to determine original names, and copy from games_df if necessary.
+
+    # names to look up (colmap maps logical -> actual CSV names)
+    date_col = colmap.get("date", "date")
+    home_col = colmap.get("home_team", "home_team")
+    away_col = colmap.get("away_team", "away_team")
+    home_pts_col = colmap.get("home_pts", "home_pts")
+    away_pts_col = colmap.get("away_pts", "away_pts")
+    margin_col = "margin"
+
+    required_cols = [date_col, home_col, away_col, home_pts_col, away_pts_col, margin_col]
+
+    # find which required columns are missing from feats_df
+    missing = [c for c in required_cols if c not in feats_df.columns]
+
+    if missing:
+        # attempt to copy missing columns from the original games_df by index alignment
+        # games_df is the pre-feature dataframe loaded earlier in this script
+        print("Some required columns are missing from feats_df; attempting to copy from games_df:", missing)
+        # If feats_df has a different index, try to reset and align by position.
+        try:
+            # best-effort: align by index - this works if add_rolling_features preserved row order/index
+            for c in missing:
+                if c in games_df.columns:
+                    feats_df[c] = games_df[c].reindex(feats_df.index).values
+                else:
+                    # couldn't find the exact name in games_df; try common alternatives
+                    # (for robustness -- not exhaustive)
+                    alt_map = {
+                        date_col: ["date", "game_date", "Date"],
+                        home_col: ["home_team", "home", "home_abbrev"],
+                        away_col: ["away_team", "away", "away_abbrev"],
+                        home_pts_col: ["home_pts", "home_score", "home_points"],
+                        away_pts_col: ["away_pts", "away_score", "away_points"],
+                        margin_col: ["margin", "point_diff", "score_diff"]
+                    }
+                    found = False
+                    for alt in alt_map.get(c, []):
+                        if alt in games_df.columns:
+                            feats_df[c] = games_df[alt].reindex(feats_df.index).values
+                            found = True
+                            break
+                    if not found:
+                        # fallback: create NaNs so dropna will still behave predictably
+                        import numpy as _np
+                        feats_df[c] = _np.nan
+                        print(f"Warning: couldn't find column '{c}' or alternatives in games_df. Filled with NaN.")
+        except Exception as e:
+            # fallback: fail with a helpful message rather than a raw KeyError
+            raise SystemExit("Failed while trying to copy missing columns from games_df into feats_df: " + str(e))
+
+    # Re-evaluate missing columns
+    still_missing = [c for c in required_cols if c not in feats_df.columns]
+    if still_missing:
+        raise SystemExit("Missing required columns in features dataframe after attempted copy: " + ", ".join(still_missing) +
+                        ". Run the debug script to inspect colmap and feats_df.columns.")
+
+    # Now it's safe to drop NA rows using the explicit required column names
+    feats_df = feats_df.dropna(subset=required_cols)
+    # --- defensive patch end ---
+
+
+    # optionally drop rows where core features are NaN (early-season)
+    train_df = feats_df.dropna(subset=feature_columns)
+
+    # 4) Train/test split by date (train on everything before last season if seasons present)
+    # Use index-aware selection and intersect with train_df.index to avoid KeyError when train_df is a subset.
+
+    def _index_mask_to_indices(df_index, mask):
+        """Return Index of df_index where mask is True (mask may be numpy array or Series)."""
+        # ensure boolean numpy array aligned to df_index positions
+        mvals = mask.values if hasattr(mask, "values") else mask
+        return df_index[mvals]
+
+    if "season" in colmap and colmap["season"] in games_df.columns:
+        # use season if present: train on seasons < max, test on max season
+        if colmap["season"] in feats_df.columns:
+            last_season = feats_df[colmap["season"]].max()
+            sel_idx = _index_mask_to_indices(feats_df.index, feats_df[colmap["season"]] < last_season)
+            sel_idx = sel_idx.intersection(train_df.index)  # only keep indices present in train_df
+            train = train_df.loc[sel_idx]
+            test  = train_df.loc[train_df.index.difference(sel_idx)]
+            if len(test) == 0:
+                # fallback to date split: last 10% for test
+                cutoff = feats_df[colmap["date"]].quantile(0.90)
+                mask = feats_df[colmap["date"]] <= cutoff
+                sel_idx = _index_mask_to_indices(feats_df.index, mask)
+                sel_idx = sel_idx.intersection(train_df.index)
+                train = train_df.loc[sel_idx]
+                test  = train_df.loc[train_df.index.difference(sel_idx)]
         else:
-            cutoff = df["date"].quantile(0.8)
-            train = df[df["date"] <= cutoff].copy()
-            test = df[df["date"] > cutoff].copy()
+            cutoff = feats_df[colmap["date"]].quantile(0.90)
+            mask = feats_df[colmap["date"]] <= cutoff
+            sel_idx = _index_mask_to_indices(feats_df.index, mask)
+            sel_idx = sel_idx.intersection(train_df.index)
+            train = train_df.loc[sel_idx]
+            test  = train_df.loc[train_df.index.difference(sel_idx)]
     else:
-        cutoff = df["date"].quantile(0.8)
-        train = df[df["date"] <= cutoff].copy()
-        test = df[df["date"] > cutoff].copy()
-    return train, test
+        cutoff = feats_df[colmap["date"]].quantile(0.90)
+        mask = feats_df[colmap["date"]] <= cutoff
+        sel_idx = _index_mask_to_indices(feats_df.index, mask)
+        sel_idx = sel_idx.intersection(train_df.index)
+        train = train_df.loc[sel_idx]
+        test  = train_df.loc[train_df.index.difference(sel_idx)]
 
-def train_and_evaluate(df, features, colmap, model_out, report_out, random_seed=42):
-    # train/test split
-    train, test = time_split_train_test(df, date_col=colmap["date"])
-    X_train = train[features]
+    print("Train size:", len(train), "Test size:", len(test))
+
+
+
+    # 5) Fit a model (RandomForest or Ridge as fallback)
+    X_train = train[feature_columns]
     y_train = train["margin"]
-    X_test = test[features]
+    X_test = test[feature_columns]
     y_test = test["margin"]
 
-    # LightGBM dataset
-    dtrain = lgb.Dataset(X_train, label=y_train)
-    dvalid = lgb.Dataset(X_test, label=y_test, reference=dtrain)
-
-    params = {
-        "objective": "regression",
-        "metric": "l1",       # MAE
-        "boosting_type": "gbdt",
-        "learning_rate": 0.03,
-        "num_leaves": 31,
-        "min_data_in_leaf": 20,
-        "verbosity": -1,
-        "seed": random_seed,
-    }
-
-    print("Training LightGBM on {} rows, validating on {} rows".format(len(X_train), len(X_test)))
-        # ---------- Train (backwards-compatible for different LightGBM versions) ----------
-    try:
-        # Newer API — accepts early_stopping_rounds & verbose_eval directly
-        model = lgb.train(
-            params,
-            dtrain,
-            valid_sets=[dtrain, dvalid],
-            valid_names=["train", "valid"],
-            num_boost_round=2000,
-            early_stopping_rounds=100,
-            verbose_eval=100,
-        )
-    except TypeError:
-        # Fallback for LightGBM builds that require callbacks instead
-        callbacks = [
-            lgb.early_stopping(stopping_rounds=100),
-            lgb.log_evaluation(period=100),
-        ]
-        model = lgb.train(
-            params,
-            dtrain,
-            valid_sets=[dtrain, dvalid],
-            valid_names=["train", "valid"],
-            num_boost_round=2000,
-            callbacks=callbacks,
-        )
-
-
-    # predictions
-    test["pred_margin"] = model.predict(X_test, num_iteration=model.best_iteration)
-    mae = mean_absolute_error(y_test, test["pred_margin"])
-    rmse = np.sqrt(mean_squared_error(y_test, test["pred_margin"]))   # compatibility fix
-    print(f"HOLDOUT MAE: {mae:.4f}, RMSE: {rmse:.4f}")
-
-
-    # simple betting backtest vs book_line (if present)
-    if "book_line" in test.columns and test["book_line"].notna().any():
-        # assume book_line is "home spread" (positive means home favored by that many)
-        test["edge"] = test["pred_margin"] - test["book_line"]
-        # backtest thresholded flat bets with -110 odds
-        stake = 100.0
-        decimal_odds = 1.909  # -110
-        bets = []
-        for _, r in test.iterrows():
-            e = r["edge"]
-            # threshold: abs(edge) >= 2 (configurable)
-            if abs(e) >= 2.0:
-                pick_home = e > 0
-                # did home cover? home_margin > book_line
-                home_cover = (r["margin"] > r["book_line"])
-                won = home_cover if pick_home else (not home_cover)
-                if won:
-                    profit = stake * (decimal_odds - 1)
-                else:
-                    profit = -stake
-                bets.append(profit)
-        total_profit = sum(bets) if bets else 0.0
-        num_bets = len(bets)
-        roi = total_profit / (stake * num_bets) if num_bets else 0.0
+    if args.model == "rf":
+        model = RandomForestRegressor(n_estimators=args.n_estimators, n_jobs=args.n_jobs, random_state=42)
     else:
-        total_profit = np.nan
-        num_bets = 0
-        roi = np.nan
+        model = Ridge(alpha=1.0)
 
-    # save model
-    joblib.dump(model, model_out)
-    print(f"Saved model to {model_out}")
+    print("Training model:", model)
+    model.fit(X_train, y_train)
 
-    # Save evaluation report (test rows with preds and edge)
-    report_cols = ["date", colmap.get("home_team"), colmap.get("away_team"), "margin", "pred_margin", "book_line", "edge"] if colmap.get("home_team") else ["date","margin","pred_margin","book_line","edge"]
-    # ensure report columns exist
-    for c in report_cols:
-        if c not in test.columns:
-            test[c] = test.get(c, np.nan)
-    test[report_cols].to_csv(report_out, index=False)
-    print(f"Saved evaluation report to {report_out}")
+    # 6) Predict and evaluate
+    preds = model.predict(X_test)
+    test = test.copy()
+    test["pred_margin"] = preds
 
-    summary = {
-        "mae": mae,
-        "rmse": rmse,
-        "num_test_games": len(test),
-        "num_train_games": len(train),
-        "num_bets": num_bets,
-        "total_profit": float(total_profit),
-        "roi": float(roi),
-        "model_path": model_out,
-        "report_path": report_out
-    }
-    return summary
+    mae = mean_absolute_error(y_test, preds)
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--csv", required=True, help="Path to games_details.csv")
-    p.add_argument("--model-out", default="spread_model.pkl", help="Path to save trained model (joblib .pkl)")
-    p.add_argument("--report-out", default="eval_report.csv", help="Path to save CSV with test predictions + evaluation")
-    args = p.parse_args()
+    # portable RMSE computation to avoid sklearn kwarg compatibility issues
+    import numpy as _np
+    mse = mean_squared_error(y_test, preds)   # always supported
+    rmse = float(_np.sqrt(mse))
+    bias = (y_test - preds).mean()
 
-    df, features, colmap = prepare_data(args.csv)
-    summary = train_and_evaluate(df, features, colmap, args.model_out, args.report_out)
-    print("Training summary:")
-    for k,v in summary.items():
-        print(f" - {k}: {v}")
+    # optional extras: r2 (import earlier if you want)
+    # from sklearn.metrics import r2_score
+    # r2 = r2_score(y_test, preds)
+    print(f"MAE: {mae:.4f}  RMSE: {rmse:.4f}  Bias(mean error): {bias:.4f}")
+
+
+    # 7) Save model and predictions
+    os.makedirs(args.model_dir, exist_ok=True)
+    model_path = os.path.join(args.model_dir, "spread_model.pkl")
+    joblib.dump({"model": model, "features": feature_columns, "colmap": colmap}, model_path)
+    print("Saved model to", model_path)
+
+    os.makedirs("eval", exist_ok=True)
+    pred_out = os.path.join("eval", "predictions.csv")
+    test_out = test[[colmap["date"], colmap["home_team"], colmap["away_team"], colmap["home_pts"], colmap["away_pts"], "pred_margin"] + feature_columns]
+    test_out.to_csv(pred_out, index=False)
+    print("Wrote predictions to", pred_out)
+
+    # 8) Optional: evaluate ATS accuracy if betting CSV provided and contains spread & whos_favored
+    if args.betting_csv:
+        print("Loading betting CSV for ATS evaluation:", args.betting_csv)
+        bet = pd.read_csv(args.betting_csv, parse_dates=[colmap.get("date", "date")])
+        # normalize keys for merging: lower-case team codes/names
+        # The training outputs use the original team values; attempt to match on lowercase short codes
+        pred_df = test_out.copy()
+        pred_df = pred_df.rename(columns={
+            colmap["date"]: "date",
+            colmap["home_team"]: "home",
+            colmap["away_team"]: "away",
+            colmap["home_pts"]: "home_pts",
+            colmap["away_pts"]: "away_pts"
+        })
+        # betting data often uses 'home'/'away' columns; try to standardize
+        bet = bet.rename(columns={args.betting_home_col: "home", args.betting_away_col: "away",
+                                  args.betting_home_pts_col: "home_pts", args.betting_away_pts_col: "away_pts"})
+        # lowercase team codes for better matching
+        pred_df["home_lower"] = pred_df["home"].astype(str).str.lower()
+        pred_df["away_lower"] = pred_df["away"].astype(str).str.lower()
+        bet["home_lower"] = bet["home"].astype(str).str.lower()
+        bet["away_lower"] = bet["away"].astype(str).str.lower()
+        bet["date"] = pd.to_datetime(bet["date"], errors="coerce")
+        merged = pd.merge(pred_df, bet[["date","home_lower","away_lower","spread","whos_favored","home_pts","away_pts"]],
+                          left_on=["date","home_lower","away_lower"], right_on=["date","home_lower","away_lower"], how="inner")
+
+        # compute ats ground truth and signed_spread
+        merged = compute_ats_results(merged, spread_col="spread", whos_favored_col="whos_favored",
+                                     home_pts_col="home_pts", away_pts_col="away_pts")
+        incl, excl, pushes = ats_accuracy_from_predictions(merged, pred_col="pred_margin", signed_spread_col="signed_spread")
+        print(f"ATS accuracy (incl pushes): {incl:.2f}%  (excl pushes): {excl:.2f}%  pushes: {pushes}")
+
+    print("Training complete.")
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument("--games-csv", dest="games_csv", required=True, help="Path to games details CSV")
+    p.add_argument("--betting-csv", dest="betting_csv", required=False, help="Optional: betting CSV for ATS eval")
+    p.add_argument("--betting-home-col", dest="betting_home_col", default="home", help="col name for home team in betting CSV")
+    p.add_argument("--betting-away-col", dest="betting_away_col", default="away", help="col name for away team in betting CSV")
+    p.add_argument("--betting-home-pts-col", dest="betting_home_pts_col", default="score_home", help="home score col in betting CSV")
+    p.add_argument("--betting-away-pts-col", dest="betting_away_pts_col", default="score_away", help="away score col in betting CSV")
+    p.add_argument("--model-dir", dest="model_dir", default="models", help="Directory to save model")
+    p.add_argument("--model", dest="model", choices=["rf","ridge"], default="rf", help="Model type")
+    p.add_argument("--n-estimators", dest="n_estimators", type=int, default=200, help="RF n_estimators")
+    p.add_argument("--n-jobs", dest="n_jobs", type=int, default=-1, help="n_jobs for RF")
+    p.add_argument("--windows", dest="windows", nargs="+", type=int, default=[5,10], help="rolling windows to compute")
+    p.add_argument("--min-games", dest="min_games", type=int, default=5, help="min games required for rolling windows")
+    args = p.parse_args()
+    main(args)
