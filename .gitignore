@@ -23,3 +23,5 @@ models/*.joblib
 # IDEs
 .vscode/
 .idea/
+data/*.csv
+*.pkl
