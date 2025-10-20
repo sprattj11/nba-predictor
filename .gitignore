@@ -32,3 +32,6 @@ eval/merged_ats_results.csv
 eval/predictions.csv
 eval_report.csv
 metrics_history.csv
+
+#.pkl
+models/spread_model.pkl
